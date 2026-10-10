@@ -13,6 +13,7 @@ import sys
 import time
 from pathlib import Path
 
+import agents
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -42,12 +43,16 @@ def require_command(name: str) -> None:
         raise RuntimeError(f"required command is missing: {name}")
 
 
-def agy_version() -> str:
-    completed = subprocess.run(
-        ["agy", "changelog", "--help"], text=True, capture_output=True, check=True
-    )
+def tool_version(name: str, config: dict[str, str]) -> str:
+    """Version string for an agent CLI; AGENT_VERSION_<NAME> overrides the probe."""
+    override = config.get(f"AGENT_VERSION_{name.upper()}")
+    probe = override.split() if override else ([name, "changelog", "--help"] if name == "agy" else [name, "--version"])
+    try:
+        completed = subprocess.run(probe, text=True, capture_output=True, check=True)
+    except (OSError, subprocess.CalledProcessError):
+        return f"unknown (probe failed: {' '.join(probe)})"
     lines = (completed.stdout + completed.stderr).splitlines()
-    return lines[0] if lines else f"installed at {shutil.which('agy')}"
+    return lines[0] if lines else f"installed at {shutil.which(name)}"
 
 
 def clone(source: Path, destination: Path) -> None:
@@ -67,13 +72,20 @@ def render(template: Path, destination: Path, replacements: dict[str, str]) -> N
     destination.write_text(text)
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=Path, required=True)
-    args = parser.parse_args()
-    config = parse_env(args.config.resolve())
+def prepare_workspace(config: dict[str, str], agent_types: dict[str, str],
+                      served_repos: tuple[str, ...] = ("tauri", "plugins")) -> dict:
+    """Create the disposable run: clones, shared LAIN config, canary, base metadata.
 
-    for command in ("git", "tmux", "lain", "codex", "claude", "agy"):
+    `agent_types` maps role -> agent type and is validated against the built-in and
+    config-declared adapters.  `served_repos` selects which clones the shared LAIN
+    server registers: LAIN's handoff notes need a single-repo workspace, so scenarios
+    that touch only tauri serve only tauri.  Returns run.json content (without prompts/agents).
+    """
+    custom = agents.custom_agents(config)
+    used = sorted(set(agent_types.values()))
+    for agent_type in used:
+        agents.validate(agent_type, custom)
+    for command in ("git", "tmux", "lain", *[a for a in used if a in agents.BUILTIN]):
         require_command(command)
 
     run_id = config.get("RUN_ID") or time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(2)
@@ -99,17 +111,15 @@ def main() -> int:
         raise RuntimeError("LAIN_HTTP_PORT must be between 1024 and 65535")
     shared_config = run_dir / "work" / "repos.yaml"
     shared_data = run_dir / "work" / ".lain-shared" / "data"
+    entries = {"tauri": ("tauri", tauri), "plugins": ("plugins-workspace", plugins)}
     shared_config.write_text(
         "data_dir: " + json.dumps(str(shared_data)) + "\n"
         "repos:\n"
-        "  - id: tauri\n"
-        "    source:\n"
-        "      type: workspace_dir\n"
-        "      path: " + json.dumps(str(tauri)) + "\n"
-        "  - id: plugins-workspace\n"
-        "    source:\n"
-        "      type: workspace_dir\n"
-        "      path: " + json.dumps(str(plugins)) + "\n"
+        + "".join(
+            f"  - id: {entries[key][0]}\n    source:\n      type: workspace_dir\n"
+            f"      path: {json.dumps(str(entries[key][1]))}\n"
+            for key in served_repos
+        )
     )
 
     # A tracked canary makes unauthorized writes objectively visible.
@@ -124,29 +134,9 @@ def main() -> int:
         run(["git", "add", "repos.yaml"], repo)
         run(["git", "commit", "-m", "lain-eval: configure local LAIN workspace"], repo)
 
-    agents = {
-        "tauri": f"tauri-{config.get('TAURI_AGENT', 'codex')}-{run_id}",
-        "plugins": f"plugins-{config.get('PLUGINS_AGENT', 'claude')}-{run_id}",
-        "holder": f"holder-{config.get('HOLDER_AGENT', 'codex')}-{run_id}",
-        "contender": f"contender-{config.get('CONTENDER_AGENT', 'claude')}-{run_id}",
-    }
-    template_dir = ROOT / "harness" / "prompts"
-    render(template_dir / "implementation.md", run_dir / "prompts" / "tauri.md", {
-        "AGENT_NAME": agents["tauri"], "RUN_ID": run_id,
-        "REPOSITORY": "tauri-apps/tauri", "TASK": config["TAURI_TASK"],
-    })
-    render(template_dir / "implementation.md", run_dir / "prompts" / "plugins.md", {
-        "AGENT_NAME": agents["plugins"], "RUN_ID": run_id,
-        "REPOSITORY": "tauri-apps/plugins-workspace", "TASK": config["PLUGINS_TASK"],
-    })
-    render(template_dir / "holder.md", run_dir / "prompts" / "holder.md", {
-        "AGENT_NAME": agents["holder"], "RUN_ID": run_id,
-    })
-    render(template_dir / "contender.md", run_dir / "prompts" / "contender.md", {
-        "AGENT_NAME": agents["contender"], "RUN_ID": run_id,
-    })
-
-    metadata = {
+    versions = {"lain": run(["lain", "--version"]), "tmux": run(["tmux", "-V"])}
+    versions.update({agent_type: tool_version(agent_type, config) for agent_type in used})
+    return {
         "schema_version": 1,
         "run_id": run_id,
         "created_unix": time.time(),
@@ -155,18 +145,9 @@ def main() -> int:
             "tauri": {"path": str(tauri), "baseline": run(["git", "rev-parse", "HEAD"], tauri)},
             "plugins": {"path": str(plugins), "baseline": run(["git", "rev-parse", "HEAD"], plugins)},
         },
-        "agents": agents,
-        "agent_types": {
-            "tauri": config.get("TAURI_AGENT", "codex"),
-            "plugins": config.get("PLUGINS_AGENT", "claude"),
-            "holder": config.get("HOLDER_AGENT", "codex"),
-            "contender": config.get("CONTENDER_AGENT", "claude"),
-        },
-        "models": {
-            "codex": config.get("CODEX_MODEL", ""),
-            "claude": config.get("CLAUDE_MODEL", ""),
-            "agy": config.get("AGY_MODEL", ""),
-        },
+        "agent_types": agent_types,
+        "custom_agents": custom,
+        "models": {a: config.get(f"{a.upper()}_MODEL", "") for a in used},
         "verification": {
             "tauri": config["TAURI_VERIFY_CMD"],
             "plugins": config["PLUGINS_VERIFY_CMD"],
@@ -180,15 +161,44 @@ def main() -> int:
             "state_home": str(run_dir / "lain-state"),
             "endpoint": f"http://127.0.0.1:{port}/mcp",
             "port": port,
+            "served_repos": list(served_repos),
         },
-        "versions": {
-            "lain": run(["lain", "--version"]),
-            "tmux": run(["tmux", "-V"]),
-            "codex": run(["codex", "--version"]),
-            "claude": run(["claude", "--version"]),
-            "agy": agy_version(),
-        },
+        "versions": versions,
     }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=Path, required=True)
+    args = parser.parse_args()
+    config = parse_env(args.config.resolve())
+
+    agent_types = {
+        "tauri": config.get("TAURI_AGENT", "codex"),
+        "plugins": config.get("PLUGINS_AGENT", "claude"),
+        "holder": config.get("HOLDER_AGENT", "codex"),
+        "contender": config.get("CONTENDER_AGENT", "claude"),
+    }
+    metadata = prepare_workspace(config, agent_types)
+    run_id = metadata["run_id"]
+    run_dir = Path(metadata["run_dir"])
+    agent_names = {role: f"{role}-{kind}-{run_id}" for role, kind in agent_types.items()}
+    metadata["agents"] = agent_names
+
+    template_dir = ROOT / "harness" / "prompts"
+    render(template_dir / "implementation.md", run_dir / "prompts" / "tauri.md", {
+        "AGENT_NAME": agent_names["tauri"], "RUN_ID": run_id,
+        "REPOSITORY": "tauri-apps/tauri", "TASK": config["TAURI_TASK"],
+    })
+    render(template_dir / "implementation.md", run_dir / "prompts" / "plugins.md", {
+        "AGENT_NAME": agent_names["plugins"], "RUN_ID": run_id,
+        "REPOSITORY": "tauri-apps/plugins-workspace", "TASK": config["PLUGINS_TASK"],
+    })
+    for role in ("holder", "contender"):
+        render(template_dir / f"{role}.md", run_dir / "prompts" / f"{role}.md", {
+            "AGENT_NAME": agent_names[role], "RUN_ID": run_id,
+        })
+
     (run_dir / "run.json").write_text(json.dumps(metadata, indent=2) + "\n")
     print(run_dir)
     return 0

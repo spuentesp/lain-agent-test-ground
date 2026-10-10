@@ -53,7 +53,7 @@ launch_window() {
   touch "$gate"
 }
 
-server="XDG_STATE_HOME=$(printf %q "$state_home") lain server --config $(printf %q "$lain_config") --transport http --port $(printf %q "$port") --log-level info"
+server="XDG_STATE_HOME=$(printf %q "$state_home") LAIN_TOOL_PROFILE=$(printf %q "${LAIN_TOOL_PROFILE:-session,social,notes,federation}") lain server --config $(printf %q "$lain_config") --transport http --port $(printf %q "$port") --log-level info"
 tmux new-session -d -s "$session" -n lain-server "bash -lc $(printf %q "$server")"
 tmux pipe-pane -o -t "$session:lain-server" "exec stdbuf -oL tee -a $(printf %q "$raw_dir/lain-server.log")"
 tmux set-option -w -t "$session:lain-server" remain-on-exit on

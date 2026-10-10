@@ -3,3 +3,4 @@ runs/
 harness/config.env
 __pycache__/
 *.pyc
+reports/
